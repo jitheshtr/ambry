@@ -55,6 +55,12 @@ public class PublicAccessLogHandler extends ChannelDuplexHandler {
   private StringBuilder sslLogMessage;
 
   private static final long INIT_TIME = -1;
+  /**
+   * Status recorded for a request that ended without a response, so that dashboards can separate these from
+   * requests that genuinely returned a 4xx. Matches nginx's non-standard 499 "Client Closed Request".
+   * Package private so that tests assert against this definition rather than duplicating the value.
+   */
+  static final int CLIENT_CLOSED_REQUEST_STATUS = 499;
   //private static final Logger logger = LoggerFactory.getLogger(PublicAccessLogHandler.class);
   private static final Logger logger = LogManager.getLogger(PublicAccessLogHandler.class);
 
@@ -164,6 +170,21 @@ public class PublicAccessLogHandler extends ChannelDuplexHandler {
   }
 
   /**
+   * Netty calls this when the channel goes inactive, which is the only callback a client-initiated abort reaches.
+   * A remote close is handled by {@code AbstractChannel.AbstractUnsafe#close}, which does not travel the pipeline's
+   * outbound chain, so neither {@link #close} nor {@link #disconnect} fires and the request would otherwise never be
+   * logged.
+   * @param ctx the {@link ChannelHandlerContext} for this channel.
+   */
+  @Override
+  public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+    if (request != null) {
+      logError(" : Channel inactive while request in progress.");
+    }
+    super.channelInactive(ctx);
+  }
+
+  /**
    * Appends specified headers to the log message if those headers are not null
    * @param tag pretty name for set of headers to append
    * @param message http message from which to log headers
@@ -221,10 +242,13 @@ public class PublicAccessLogHandler extends ChannelDuplexHandler {
   }
 
   /**
-   * Logs error message
+   * Logs an access log entry for a request that ended without a response, and clears the request state so that the
+   * remaining channel lifecycle callbacks do not log the same request a second time.
    * @param msg the message to log
    */
   private void logError(String msg) {
+    logMessage.append("status=").append(CLIENT_CLOSED_REQUEST_STATUS).append(", ");
+    structuredLogMessage.put("status", String.valueOf(CLIENT_CLOSED_REQUEST_STATUS));
     logDurations();
     logMessage.append(msg);
     structuredLogMessage.put("error", msg);
@@ -234,6 +258,7 @@ public class PublicAccessLogHandler extends ChannelDuplexHandler {
     } else {
       publicAccessLogger.logError(logMessage.toString());
     }
+    reset();
   }
 
   /**

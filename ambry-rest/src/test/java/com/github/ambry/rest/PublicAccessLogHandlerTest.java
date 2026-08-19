@@ -14,7 +14,17 @@
 package com.github.ambry.rest;
 
 import com.codahale.metrics.MetricRegistry;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.channel.local.LocalAddress;
+import io.netty.channel.local.LocalChannel;
+import io.netty.channel.local.LocalServerChannel;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
@@ -37,6 +47,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
@@ -160,6 +173,102 @@ public class PublicAccessLogHandlerTest {
     doRequestHandleWithChunkedResponse(false);
     // SSL enabled
     doRequestHandleWithChunkedResponse(true);
+  }
+
+  /**
+   * Tests that a request aborted by the client on a real event loop is logged. A remote close does not travel the
+   * pipeline's outbound chain, so {@code channelInactive} is the only callback the handler receives. An
+   * {@link EmbeddedChannel} cannot cover this: its {@code close()} is invoked directly by the test, which exercises
+   * the outbound path that a client abort never takes.
+   * @throws Exception
+   */
+  @Test
+  public void testAbortedRequestOnRealEventLoopIsLogged() throws Exception {
+    EventLoopGroup group = new DefaultEventLoopGroup(1);
+    LocalAddress address = new LocalAddress("publicAccessLogHandlerTest-" + System.nanoTime());
+    AtomicReference<Channel> serverChannelRef = new AtomicReference<>();
+    CountDownLatch serverChannelInitialized = new CountDownLatch(1);
+    try {
+      // No responder is installed, so the request stays in flight until the client goes away.
+      Channel serverBind = new ServerBootstrap().group(group)
+          .channel(LocalServerChannel.class)
+          .childHandler(new ChannelInitializer<LocalChannel>() {
+            @Override
+            protected void initChannel(LocalChannel ch) {
+              ch.pipeline()
+                  .addLast(new PublicAccessLogHandler(publicAccessLogger, new NettyMetrics(new MetricRegistry())));
+              serverChannelRef.set(ch);
+              serverChannelInitialized.countDown();
+            }
+          })
+          .bind(address)
+          .sync()
+          .channel();
+      Channel clientChannel = new Bootstrap().group(group)
+          .channel(LocalChannel.class)
+          .handler(new ChannelInboundHandlerAdapter())
+          .connect(address)
+          .sync()
+          .channel();
+      HttpHeaders headers = new DefaultHttpHeaders();
+      headers.add(HttpHeaderNames.CONTENT_LENGTH, 100);
+      clientChannel.writeAndFlush(RestTestUtils.createRequest(HttpMethod.POST, "POST", headers)).sync();
+      Assert.assertTrue("Server channel was never initialized",
+          serverChannelInitialized.await(5, TimeUnit.SECONDS));
+
+      clientChannel.close().sync();
+      Channel serverChannel = serverChannelRef.get();
+      Assert.assertTrue("Server channel did not close", serverChannel.closeFuture().await(5, TimeUnit.SECONDS));
+      // channelInactive is fired as a task on the event loop, so drain it before asserting.
+      serverChannel.eventLoop().submit(() -> {
+      }).sync();
+
+      String logEntry = publicAccessLogger.getLastPublicAccessLogEntry();
+      Assert.assertTrue("Aborted request was not logged at error level: " + logEntry, logEntry.startsWith("Error:"));
+      Assert.assertTrue("Aborted request log entry has no client closed request status: " + logEntry,
+          logEntry.contains("status=" + PublicAccessLogHandler.CLIENT_CLOSED_REQUEST_STATUS));
+      serverBind.close().sync();
+    } finally {
+      group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS);
+    }
+  }
+
+  /**
+   * Tests that a request in flight when the channel goes away is logged exactly once, even though both
+   * {@code close()} and {@code channelInactive} run while it is still open.
+   * @throws Exception
+   */
+  @Test
+  public void testAbortedRequestIsLoggedOnlyOnce() throws Exception {
+    EmbeddedChannel channel = new EmbeddedChannel(
+        new PublicAccessLogHandler(publicAccessLogger, new NettyMetrics(new MetricRegistry())));
+    HttpHeaders headers = new DefaultHttpHeaders();
+    headers.add(HttpHeaderNames.CONTENT_LENGTH, 100);
+    // No LastHttpContent, so the request is still in flight when the channel is closed.
+    channel.writeInbound(RestTestUtils.createRequest(HttpMethod.POST, "POST", headers));
+    channel.close().sync();
+
+    String allEntries = publicAccessLogger.getAllPublicAccessLogEntries();
+    Assert.assertEquals("Aborted request should be logged exactly once, got: " + allEntries, 1,
+        countOccurrences(allEntries, "Error:"));
+    Assert.assertTrue("Aborted request log entry has no client closed request status: " + allEntries,
+        allEntries.contains("status=" + PublicAccessLogHandler.CLIENT_CLOSED_REQUEST_STATUS));
+  }
+
+  /**
+   * Counts non-overlapping occurrences of {@code needle} in {@code haystack}.
+   * @param haystack the string to search.
+   * @param needle the string to count.
+   * @return the number of occurrences.
+   */
+  private static int countOccurrences(String haystack, String needle) {
+    int count = 0;
+    int index = 0;
+    while ((index = haystack.indexOf(needle, index)) != -1) {
+      count++;
+      index += needle.length();
+    }
+    return count;
   }
 
   // requestHandleTest() helpers

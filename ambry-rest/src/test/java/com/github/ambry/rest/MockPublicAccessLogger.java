@@ -37,4 +37,11 @@ public class MockPublicAccessLogger extends PublicAccessLogger {
   public String getLastPublicAccessLogEntry() {
     return lastPublicAccessLogEntry;
   }
+
+  /**
+   * @return every entry logged so far, concatenated in the order they were logged.
+   */
+  public String getAllPublicAccessLogEntries() {
+    return publicAccessLogger.toString();
+  }
 }
