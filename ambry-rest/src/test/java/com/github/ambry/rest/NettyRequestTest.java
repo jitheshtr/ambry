@@ -16,6 +16,8 @@ package com.github.ambry.rest;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
 import com.github.ambry.commons.Callback;
+import com.github.ambry.commons.CallbackUtils;
+import com.github.ambry.commons.RetainingAsyncWritableChannel;
 import com.github.ambry.config.NettyConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.router.AsyncWritableChannel;
@@ -73,6 +75,7 @@ import java.util.Properties;
 import java.util.Queue;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
@@ -610,6 +613,55 @@ public class NettyRequestTest {
   public void headerAndContentSizeMismatchTest() throws Exception {
     sizeInHeaderMoreThanContentTest();
     sizeInHeaderLessThanContentTest();
+  }
+
+  @Test
+  public void testDigestAvailableInReadCompletionCallback() throws Exception {
+    byte[] body = {1, 2, 3};
+    try (NettyRequest request = createNettyRequest(HttpMethod.PUT, "/", null, new MockChannel());
+        RetainingAsyncWritableChannel sink = new RetainingAsyncWritableChannel()) {
+      request.setDigestAlgorithm("MD5");
+      CompletableFuture<Long> read = new CompletableFuture<>();
+      CompletableFuture<byte[]> digest = read.thenApply(size -> request.getDigest());
+      request.readInto(sink, CallbackUtils.fromCompletableFuture(read));
+      HttpContent last = new DefaultLastHttpContent(Unpooled.wrappedBuffer(body));
+      try {
+        request.addContent(last);
+        assertArrayEquals(MessageDigest.getInstance("MD5").digest(body), digest.get(5, TimeUnit.SECONDS));
+      } finally {
+        last.release();
+      }
+    }
+  }
+
+  @Test
+  public void testFailedFinalWriteDoesNotPublishDigest() throws Exception {
+    try (NettyRequest request = createNettyRequest(HttpMethod.PUT, "/", null, new MockChannel());
+        ByteBufferAsyncWritableChannel sink = new ByteBufferAsyncWritableChannel()) {
+      request.setDigestAlgorithm("MD5");
+      Future<Long> read = request.readInto(sink, null);
+      HttpContent last = new DefaultLastHttpContent(Unpooled.wrappedBuffer(new byte[]{1}));
+      try {
+        request.addContent(last);
+        assertNotNull(sink.getNextChunk(5000));
+        IOException failure = new IOException("Final write failed");
+        sink.resolveOldestChunk(failure);
+        try {
+          read.get(5, TimeUnit.SECONDS);
+          fail("Expected read failure");
+        } catch (ExecutionException expected) {
+          assertSame(failure, expected.getCause());
+        }
+        try {
+          request.getDigest();
+          fail("A failed read must not publish the digest");
+        } catch (IllegalStateException expected) {
+          // The body did not drain successfully.
+        }
+      } finally {
+        last.release();
+      }
+    }
   }
 
   /**

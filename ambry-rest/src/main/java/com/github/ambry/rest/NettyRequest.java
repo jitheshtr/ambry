@@ -499,7 +499,6 @@ public class NettyRequest implements RestRequest {
       httpContent.release();
       throw e;
     }
-    allContentReceived = isLast;
   }
 
   /**
@@ -667,6 +666,10 @@ public class NettyRequest implements RestRequest {
      */
     public void invokeCallback(Exception exception) {
       if (callbackInvoked.compareAndSet(false, true)) {
+        if (exception == null) {
+          // The future waiter and callback can both read the digest as soon as the read succeeds.
+          allContentReceived = true;
+        }
         futureResult.done(totalBytesRead.get(), exception);
         if (callback != null) {
           callback.onCompletion(totalBytesRead.get(), exception);
